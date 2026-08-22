@@ -1303,3 +1303,177 @@ class TestGrok43StaleCacheGuard:
                 slug, base_url=base, api_key="", provider="xai"
             )
             assert ctx == 256_000, f"{slug} should stay 256000, got {ctx}"
+
+
+# =========================================================================
+# ssoni (OmniRoute) — context length must come from the provider's
+# live /v1/models endpoint, not the hardcoded DEFAULT_CONTEXT_LENGTHS.
+# See #22401.
+# =========================================================================
+
+class TestSsoniProviderContextResolution:
+    """Regression tests for ssoni provider context-length resolution.
+
+    Bug (#22401): ssoni is a *known* provider (auto-registered in
+    ``_URL_TO_PROVIDER``), so the generic custom-endpoint probe at step 2 of
+    ``get_model_context_length`` is skipped for it. models.dev has no ssoni
+    data, so the resolver fell through to the hardcoded
+    ``DEFAULT_CONTEXT_LENGTHS`` table — which can disagree with the
+    provider's actual per-model cap.
+
+    Real provider data (verified live 2026-06-25 against
+    https://api.ssoni.net/v1/models):
+        - ``opencode-go/deepseek-v4-pro`` -> context_length 200000
+        - ``ds/deepseek-v4-pro``          -> context_length 1000000
+    The hardcoded table says ``deepseek-v4-pro -> 1,000,000`` for both, so the
+    pre-fix resolver reported 1,000,000 for ``opencode-go/deepseek-v4-pro``
+    even though the provider caps it at 200,000.
+
+    Fix: a provider-aware ``ssoni`` branch probes the live /v1/models endpoint
+    and takes priority over the hardcoded table.
+    """
+
+    SSONI_URL = "https://api.ssoni.net/v1"
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.get_cached_context_length", return_value=None)
+    @patch("agent.model_metadata.save_context_length")
+    def test_provider_value_wins_over_hardcoded_for_capped_slug(
+        self, _save, _cached, _or_fetch
+    ):
+        """``opencode-go/deepseek-v4-pro`` must report the provider's 200K cap,
+        NOT the hardcoded 1M (which matches via the 'deepseek-v4-pro' substring)."""
+        with patch(
+            "agent.model_metadata.fetch_endpoint_model_metadata",
+            return_value={
+                "opencode-go/deepseek-v4-pro": {"context_length": 200000},
+                "ds/deepseek-v4-pro": {"context_length": 1000000},
+            },
+        ):
+            ctx = get_model_context_length(
+                "opencode-go/deepseek-v4-pro",
+                base_url=self.SSONI_URL,
+                api_key="k",
+                provider="ssoni",
+            )
+        assert ctx == 200000, (
+            f"ssoni opencode-go/deepseek-v4-pro must resolve to provider value "
+            f"200000, not hardcoded 1000000 (got {ctx})"
+        )
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.get_cached_context_length", return_value=None)
+    @patch("agent.model_metadata.save_context_length")
+    def test_provider_value_matches_for_uncapped_slug(
+        self, _save, _cached, _or_fetch
+    ):
+        """``ds/deepseek-v4-pro`` reports 1M on the provider, matching hardcoded."""
+        with patch(
+            "agent.model_metadata.fetch_endpoint_model_metadata",
+            return_value={"ds/deepseek-v4-pro": {"context_length": 1000000}},
+        ):
+            ctx = get_model_context_length(
+                "ds/deepseek-v4-pro",
+                base_url=self.SSONI_URL,
+                api_key="k",
+                provider="ssoni",
+            )
+        assert ctx == 1000000
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.get_cached_context_length", return_value=None)
+    def test_probe_value_is_persisted_to_disk(self, _cached, _or_fetch):
+        """The provider-derived context length must be saved to the cache."""
+        with patch(
+            "agent.model_metadata.fetch_endpoint_model_metadata",
+            return_value={"opencode-go/deepseek-v4-pro": {"context_length": 200000}},
+        ), patch("agent.model_metadata.save_context_length") as mock_save:
+            ctx = get_model_context_length(
+                "opencode-go/deepseek-v4-pro",
+                base_url=self.SSONI_URL,
+                api_key="k",
+                provider="ssoni",
+            )
+        assert ctx == 200000
+        mock_save.assert_called_once_with(
+            "opencode-go/deepseek-v4-pro", self.SSONI_URL, 200000
+        )
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={})
+    @patch("agent.model_metadata.get_cached_context_length", return_value=None)
+    @patch("agent.model_metadata.save_context_length")
+    def test_probe_failure_falls_back_to_hardcoded(
+        self, _save, _cached, _ep_fetch, _or_fetch
+    ):
+        """When the provider endpoint returns no metadata, fall back to the
+        hardcoded DEFAULT_CONTEXT_LENGTHS (don't error out)."""
+        with patch(
+            "agent.models_dev.lookup_models_dev_context", return_value=None
+        ):
+            ctx = get_model_context_length(
+                "ds/deepseek-v4-pro",
+                base_url=self.SSONI_URL,
+                api_key="",
+                provider="ssoni",
+            )
+        assert ctx == 1_000_000, (
+            "When ssoni /v1/models misses, the 'deepseek-v4-pro' hardcoded "
+            "default (1M) must be the fallback"
+        )
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    @patch("agent.model_metadata.save_context_length")
+    def test_stale_hardcoded_cache_is_bypassed_by_live_probe(
+        self, _save, mock_ep, _or_fetch, tmp_path
+    ):
+        """A cached value seeded from the hardcoded table (pre-fix) must be
+        bypassed so the live provider probe reconciles it. Mirrors the Nous
+        portal bypass: ssoni's /v1/models is authoritative."""
+        # Seed the persistent cache with the WRONG (hardcoded) value.
+        cache_file = tmp_path / "context_length_cache.yaml"
+        import yaml as _yaml
+        cache_file.write_text(_yaml.dump({"context_lengths": {
+            f"opencode-go/deepseek-v4-pro@{self.SSONI_URL}": 1_000_000,
+        }}))
+        mock_ep.return_value = {
+            "opencode-go/deepseek-v4-pro": {"context_length": 200000},
+        }
+        with patch(
+            "agent.model_metadata._get_context_cache_path", return_value=cache_file
+        ):
+            ctx = get_model_context_length(
+                "opencode-go/deepseek-v4-pro",
+                base_url=self.SSONI_URL,
+                api_key="k",
+                provider="ssoni",
+            )
+        assert ctx == 200000, (
+            "Stale hardcoded-derived cache (1M) must be bypassed in favour of "
+            f"the live provider probe (200K); got {ctx}"
+        )
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.get_cached_context_length", return_value=None)
+    @patch("agent.model_metadata.save_context_length")
+    def test_provider_inferred_from_url_when_provider_omitted(
+        self, _save, _cached, _or_fetch
+    ):
+        """``effective_provider`` is inferred from the ssoni base URL when the
+        caller passes provider='' (as the gateway/CLI display path often does),
+        so the ssoni branch still fires."""
+        with patch(
+            "agent.model_metadata.fetch_endpoint_model_metadata",
+            return_value={"opencode-go/deepseek-v4-pro": {"context_length": 200000}},
+        ):
+            ctx = get_model_context_length(
+                "opencode-go/deepseek-v4-pro",
+                base_url=self.SSONI_URL,
+                api_key="k",
+                provider="",
+            )
+        assert ctx == 200000, (
+            "ssoni must be inferred from the base URL when provider is empty, "
+            f"and the live probe must win (got {ctx})"
+        )

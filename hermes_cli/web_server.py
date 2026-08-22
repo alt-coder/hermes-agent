@@ -2233,7 +2233,7 @@ def get_model_options():
         # affordance instead of hiding the provider entirely.
         return build_models_payload(
             load_picker_context(),
-            max_models=50,
+            max_models=500,
             include_unconfigured=True,
             picker_hints=True,
             canonical_order=True,
@@ -2306,7 +2306,7 @@ def get_recommended_default_model(provider: str = ""):
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
-        payload = build_models_payload(load_picker_context(), max_models=50)
+        payload = build_models_payload(load_picker_context(), max_models=500)
         for row in payload.get("providers", []):
             if str(row.get("slug", "")).lower() == slug:
                 models = row.get("models") or []

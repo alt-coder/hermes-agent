@@ -11191,6 +11191,16 @@ class GatewayRunner:
             )
 
             if has_picker:
+                # Always fetch the live model list when the picker opens —
+                # bust the disk cache so newly added/removed upstream models
+                # (e.g. 9router combos, OpenRouter catalog changes) surface
+                # immediately without needing `/model --refresh`.
+                try:
+                    from hermes_cli.models import clear_provider_models_cache
+                    clear_provider_models_cache()
+                except Exception:
+                    pass
+
                 try:
                     providers = list_picker_providers(
                         current_provider=current_provider,
@@ -11198,7 +11208,11 @@ class GatewayRunner:
                         current_model=current_model,
                         user_providers=user_provs,
                         custom_providers=custom_provs,
-                        max_models=50,
+                        # No hard cap: the inline keyboard paginates (8/page), so a
+                        # large live-discovered catalog (e.g. ssoni = 135 models)
+                        # must not be silently truncated. 500 = "all models for any
+                        # real provider".
+                        max_models=500,
                     )
                 except Exception:
                     providers = []

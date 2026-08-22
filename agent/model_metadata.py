@@ -1624,6 +1624,21 @@ def get_model_context_length(
                     model, base_url,
                 )
                 # Fall through; step 5b reconciles and overwrites if portal responds.
+            # ssoni (OmniRoute): the provider's /v1/models endpoint is
+            # authoritative (rich per-model context_length). Bypass the
+            # persistent cache so the step-5d2 live probe always reconciles
+            # against it — this corrects pre-fix entries seeded from the
+            # hardcoded DEFAULT_CONTEXT_LENGTHS table (which can disagree
+            # with the provider's actual cap) without touching the on-disk
+            # file when the endpoint is unreachable. The in-memory 300s
+            # endpoint metadata cache amortises the per-call cost to ~0
+            # within a process. See #22401.
+            elif _infer_provider_from_url(base_url) == "ssoni":
+                logger.debug(
+                    "Bypassing persistent cache for %s@%s (ssoni /v1/models authoritative)",
+                    model, base_url,
+                )
+                # Fall through; step 5d2 reconciles and overwrites if endpoint responds.
             else:
                 return cached
 
@@ -1749,6 +1764,24 @@ def get_model_context_length(
         # in models.dev yet. Preserve that higher-fidelity endpoint lookup.
         ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
         if ctx is not None:
+            return ctx
+    # 5d2. ssoni (OmniRoute) — exposes authoritative context_length via its
+    # OpenAI-compatible /v1/models endpoint (rich per-model metadata:
+    # context_length, max_input_tokens, max_output_tokens). ssoni is a
+    # *known* provider (auto-registered in _URL_TO_PROVIDER), so the generic
+    # custom-endpoint probe at step 2 is skipped for it — and models.dev has
+    # no ssoni data — so without this branch the resolver would fall through
+    # to the hardcoded DEFAULT_CONTEXT_LENGTHS table, which can disagree with
+    # the provider's actual cap (e.g. ``opencode-go/deepseek-v4-pro`` resolves
+    # to 1,000,000 via the ``deepseek-v4-pro`` substring, but ssoni serves it
+    # at 200,000). Probe the live endpoint and persist the result so the
+    # next lookup is cache-fast and the displayed context window reflects
+    # the provider-enforced value. See #22401.
+    if effective_provider == "ssoni" and base_url:
+        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        if ctx is not None:
+            if ctx > 0:
+                save_context_length(model, base_url, ctx)
             return ctx
     # 5e. Ollama native /api/show probe — runs for ANY provider with a
     # base_url, not just ollama-cloud.  Ollama-compatible servers expose

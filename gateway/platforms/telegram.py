@@ -2985,8 +2985,9 @@ class TelegramAdapter(BasePlatformAdapter):
         buttons: list = []
         for i, model_id in enumerate(page_models):
             abs_idx = start + i
-            short = model_id.split("/")[-1] if "/" in model_id else model_id
-            if len(short) > 38:
+            short = model_id  # show full ID so ds/deepseek-v4-pro ≠ deepseek/deepseek-v4-pro
+            if len(short) > 42:
+                short = short[:39] + "..."
                 short = short[:35] + "..."
             buttons.append(
                 InlineKeyboardButton(short, callback_data=f"mm:{abs_idx}")
